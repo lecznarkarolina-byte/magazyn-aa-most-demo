@@ -1,0 +1,62 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict');
+const {JSDOM}=require('jsdom');
+const path=require('path'),dir=path.join(__dirname,'..');
+const html=fs.readFileSync(path.join(dir,'index.html'),'utf8'),portable=fs.readFileSync(path.join(dir,'kod-aplikacji.html'),'utf8');
+const results=[];function check(name,fn){try{fn();results.push({name,ok:true});console.log('PASS '+name)}catch(e){results.push({name,ok:false,error:e.message});console.log('FAIL '+name+' '+e.message)}}
+function boot(source=html,stored=null,url='https://demo.test/'){
+ const dom=new JSDOM(source,{url,runScripts:'outside-only',pretendToBeVisual:true}),w=dom.window,errors=[],alerts=[],clips=[],downloads=[],requests=[];
+ w.HTMLElement.prototype.scrollIntoView=function(){};w.alert=t=>alerts.push(t);w.confirm=()=>true;w.matchMedia=()=>({matches:false});w.Blob=Blob;
+ w.console.error=(...x)=>errors.push(x.map(v=>v.message||v).join(' '));w.console.warn=()=>{};
+ Object.defineProperty(w.navigator,'clipboard',{value:{writeText:async t=>clips.push(t)}});
+ w.URL.createObjectURL=b=>{downloads.push(b);return 'blob:demo-test'};w.URL.revokeObjectURL=()=>{};w.HTMLAnchorElement.prototype.click=function(){};
+ w.fetch=async u=>{requests.push(String(u));return {ok:true,text:async()=>portable}};
+ if(stored)for(const[k,v]of Object.entries(stored))w.localStorage.setItem(k,v);
+ const ctx=dom.getInternalVMContext(),ev=code=>vm.runInContext(code,ctx);
+ for(const m of source.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)){if(m[1].includes('application/json')||!m[2].trim())continue;try{ev(m[2])}catch(e){errors.push(e.message)}}
+ return {dom,w,d:w.document,ev,errors,alerts,clips,downloads,requests};
+}
+const tick=()=>new Promise(r=>setTimeout(r,25));
+(async()=>{
+ const t=boot();let{w,d,ev}=t;await tick();
+ const click=async selector=>{const e=d.querySelector(selector);assert(e,'Missing '+selector);e.click();await tick()};
+ const input=(id,v)=>{d.getElementById(id).value=String(v)},change=(id,v)=>{input(id,v);d.getElementById(id).dispatchEvent(new w.Event('change',{bubbles:true}))};
+ const text=id=>d.getElementById(id).textContent;
+ const rpc=async(name,args)=>{const r=await ev(`db.rpc(${JSON.stringify(name)},${JSON.stringify(args)})`);assert(!r.error,r.error?.message);return r.data};
+ const snap=()=>w.mostDemo.snapshot(),snapshot=()=>ev('data.snapshot');
+ check('Start bez logowania i błędów JS',()=>{assert.deepEqual(t.errors,[]);assert(!d.getElementById('app').classList.contains('hidden'));assert(d.getElementById('login').hidden)});
+ check('Katalog 115 pozycji i komplet adresów okładek',()=>{assert.equal(snap().tables.products.length,115);assert(snap().tables.products.every(p=>p.image_url))});
+ check('Wszystkie zakładki aktualnej aplikacji i kod',()=>{const ids=[...d.querySelectorAll('#nav button')].map(b=>b.dataset.id);for(const id of ['home','stock','sales','zk','bsk','events','budget','stats','history','reports','contacts','settings','reuse']){assert(ids.includes(id));ev(`view('${id}')`);assert.equal(d.querySelector('main section.active').id,id)}});
+ check('Fikcyjne sprzedaże, należność, ZK, BSK i wydarzenia na starcie',()=>{const s=snap();assert(s.tables.most_aa_sales.length>=2);assert(s.tables.most_aa_sales.some(x=>x.total_amount>x.paid_amount));assert(s.tables.most_zk_issues.length);assert(s.tables.most_bsk_orders.length);assert(s.tables.most_events.some(e=>e.status==='planned'));assert(s.tables.most_events.some(e=>e.status==='active'));assert(s.tables.most_event_sales.length)});
+ check('Oddzielne fundusze i poprawny snapshot',()=>{const s=snap(),ledger=s.tables.most_cash_ledger;assert.equal(snapshot().most_cash,Math.round(ledger.filter(e=>e.fund==='MOST').reduce((n,e)=>n+e.amount,0)*100)/100);assert.equal(snapshot().zk_cash,300);assert.equal(snapshot().stock_value,Math.round(s.tables.products.reduce((n,p)=>n+p.stock*p.sale_price,0)*100)/100)});
+ ev("view('sales')");change('saleGroup','group-1');const p=snap().tables.products.find(p=>p.category==='Książki'&&p.name.includes('Uwierzyli'))||snap().tables.products[1];change('saleCategory',p.category_id);change('saleProduct',p.id);input('saleQty',2);
+ const before=snapshot().most_cash,stockBefore=snap().tables.products.find(x=>x.id===p.id).stock;
+ await click('#addReservation');check('Rezerwacja AA: koszyk bez zmiany gotówki i półki',()=>{assert.equal(snapshot().most_cash,before);assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,stockBefore);assert(snap().tables.most_reservations.some(r=>r.group_id==='group-1'&&r.status==='active'))});
+ input('paid-group-1','1.10');await click('[data-action="checkout"][data-id="group-1"]');
+ check('Sprzedaż AA z częściową wpłatą 1,10 zł',()=>{assert.equal(snapshot().most_cash,Math.round((before+1.10)*100)/100);assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,stockBefore-2);assert(snap().tables.most_aa_sales.some(s=>s.paid_amount===1.1))});
+ const debt=snap().tables.most_aa_sales.find(s=>s.total_amount>s.paid_amount);ev("view('budget')");change('paymentSaleBudget',debt.id);input('paymentAmountBudget','0.29');const cash0=snapshot().most_cash;await click('#recordPaymentBudget');check('Spłata należności AA z groszami',()=>assert.equal(snapshot().most_cash,Math.round((cash0+.29)*100)/100));
+ const z0=snapshot().zk_cash,adv0=snapshot().zk_advance_obligation;ev("view('zk')");input('zkPaymentAmount','0.57');await click('#zkPayment');check('Wpłata ZK nie zmienia gotówki MOST',()=>{assert.equal(snapshot().zk_cash,Math.round((z0+.57)*100)/100);assert.equal(snapshot().zk_advance_obligation,Math.round((adv0+.57)*100)/100)});
+ change('zkProduct',p.id);input('zkQty',1);await click('#zkAdd');const phys=snap().tables.products.find(x=>x.id===p.id).stock,zcash=snapshot().zk_cash;await click('#zkIssue');check('Wydanie ZK zmniejsza półkę, rozlicza przedpłatę, bez zmiany gotówki',()=>{assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,phys-1);assert.equal(snapshot().zk_cash,zcash)});
+ ev("view('bsk')");change('bskProduct',p.id);input('bskQty',2);const bcash=snapshot().most_cash,bstock=snap().tables.products.find(x=>x.id===p.id).stock;await click('#bskAdd');await click('#bskCreate');let order=snap().tables.most_bsk_orders.at(-1);
+ check('BSK robocze zamówienie bez zmiany gotówki i półki',()=>{assert.equal(order.status,'draft');assert.equal(snapshot().most_cash,bcash);assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,bstock);assert(!d.getElementById('orders').hidden)});
+ await click(`[data-bsk="confirm"][data-id="${order.id}"]`);await click(`[data-bsk="pay"][data-id="${order.id}"]`);await click(`[data-bsk="receive"][data-id="${order.id}"]`);
+ check('BSK potwierdzenie, płatność i przyjęcie dostawy',()=>{assert.equal(snap().tables.most_bsk_orders.find(o=>o.id===order.id).status,'received');assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,bstock+2);assert.equal(snapshot().most_cash,Math.round((bcash-2*p.sale_price)*100)/100)});
+ const badBefore=JSON.stringify(snap());const bad=await ev(`db.rpc('most_add_reservation',{p_group_id:'group-1',p_product_id:${JSON.stringify(p.id)},p_quantity:99999})`);check('Niedostępna ilość blokowana bez częściowego zapisu',()=>{assert(bad.error);assert.equal(JSON.stringify(snap()),badBefore)});
+ const id=await rpc('most_event_create',{p_name:'Testowe wydarzenie','p_event_date':new Date().toISOString().slice(0,10),p_notes:'Dane testowe'});await rpc('most_event_allocate',{p_event_id:id,p_product_id:p.id,p_quantity:3});await rpc('most_event_start',{p_event_id:id});const eventStock=snap().tables.products.find(x=>x.id===p.id).stock,eventCash=(await ev("db.rpc('most_get_financial_snapshot')")).data.most_cash;
+ const request={p_event_id:id,p_items:[{product_id:p.id,quantity:2}],p_request_id:'same-request-demo'};await rpc('most_event_sell',request);const afterOnce=JSON.stringify(snap());await rpc('most_event_sell',request);
+ check('Wydarzenie: sprzedaż tylko przydziału i brak powtórnego księgowania',()=>{assert.equal(JSON.stringify(snap()),afterOnce);assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,eventStock-2)});
+ await rpc('most_event_close',{p_event_id:id});check('Rozliczenie zwrotu niesprzedanej literatury wydarzenia',()=>{const item=snap().tables.most_event_items.find(i=>i.event_id===id);assert.equal(item.returned,1);assert.equal(item.sold,2);assert.equal(snap().tables.products.find(x=>x.id===p.id).stock,eventStock-2)});
+ ev("view('events')");await tick();check('Widok wydarzeń: załadowane przykłady i historia',()=>{assert(d.getElementById('evSelect').options.length>=3);assert(!d.getElementById('evDetail').hidden)});
+ ev("view('contacts')");change('contactGroup','group-1');input('contactPerson','Kontakt testowy');input('contactPhone','000 000 999');await click('#saveContact');check('Dodawanie kontaktu lokalnie',()=>assert(snap().tables.most_group_contacts.some(c=>c.person_label==='Kontakt testowy')));
+ ev("view('stats')");await click('#loadStats');check('Widoczne statystyki z przykładowych transakcji',()=>{const cards=[...d.querySelectorAll('.most-chart-card')];assert(cards.length>=5);assert(cards.every(c=>w.getComputedStyle(c).display!=='none'));assert(text('statsBody').includes('Grupa Przykładowa'))});
+ ev("view('reports')");await click('#generateReport');check('Sprawozdanie fikcyjne i uwzględnione wydarzenia',()=>{assert(text('reportBody').includes('DANE FIKCYJNE'));assert(text('reportBody').includes('Wydarzenia (DEMO)'));assert(!text('reportBody').includes('675,70'))});
+ ev("view('stock')");input('search','Uwierzyli');d.getElementById('search').dispatchEvent(new w.Event('input'));check('Wyszukiwarka magazynu',()=>assert(d.querySelectorAll('#stockList .item').length>=1));
+ ev("view('settings')");await click('#themeDark');check('Tryb ciemny',()=>assert(d.body.classList.contains('most-dark')));await click('#exportBackup');await tick();check('Eksport kompletu danych demo',()=>assert(t.downloads.length>=1));
+ const exportText=await t.downloads.at(-1).text();check('Eksport obejmuje wydarzenia i kontakty',()=>{const e=JSON.parse(exportText);assert(e.tables.most_events.length);assert(e.tables.most_group_contacts.length)});
+ ev("view('reuse')");await click('#copyDemoCode');check('Kopiowanie całego kodu aplikacji',()=>{assert(t.clips.at(-1).includes('demoLocalEngine'));assert(t.clips.at(-1).includes('demoCatalog'));assert(!t.clips.at(-1).includes('sb_publishable_'))});await click('#downloadDemoCode');check('Pobieranie samodzielnego HTML',()=>assert(t.downloads.length>=2));
+ const storage={...w.localStorage},t2=boot(html,storage);await tick();check('Dane zachowane po ponownym uruchomieniu',()=>{for(const name of ['products','most_aa_sales','most_cash_ledger','most_bsk_orders','most_events','most_group_contacts'])assert.equal(JSON.stringify(t2.w.mostDemo.snapshot().tables[name]),JSON.stringify(snap().tables[name]));assert.equal(t2.w.mostDemo.snapshot().zkAdvance,snap().zkAdvance)});t2.w.close();
+ const t3=boot(portable,null,'https://wlasna-kopia.test/');await tick();check('Samodzielna kopia startuje bez zależności od oryginału',()=>{assert.deepEqual(t3.errors,[]);assert.equal(t3.w.mostDemo.snapshot().tables.products.length,115);assert(!t3.d.getElementById('app').classList.contains('hidden'));assert(!/script src=/.test(portable))});t3.w.close();
+ check('Brak prywatnej bazy i kluczy w demo oraz kodzie do kopiowania',()=>{for(const s of [html,portable])assert(!/sb_publishable_|hbxzwyswyasueakudkgk|window\.supabase|cdn.jsdelivr.net/.test(s));assert(t.requests.every(u=>!u.includes('supabase')))});
+ check('Brak nieobsłużonych błędów aplikacji',()=>assert.deepEqual(t.errors,[]));
+ w.mostDemo.reset();check('Reset przywraca przykładowe dane i usuwa tylko dane demo',()=>{assert.equal(snap().tables.products.length,115);assert(!snap().tables.most_events.some(e=>e.name==='Testowe wydarzenie'));assert.equal(snap().tables.most_events.length,2)});
+ w.close();fs.writeFileSync(path.join(__dirname,'test-results.json'),JSON.stringify(results,null,2));console.log('TOTAL',results.length,'PASS',results.filter(x=>x.ok).length,'FAIL',results.filter(x=>!x.ok).length);if(results.some(x=>!x.ok))process.exitCode=1;
+})().catch(e=>{console.error(e);process.exitCode=1});
